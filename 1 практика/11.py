@@ -161,6 +161,37 @@ def log_operation(operation_type: str, filename: Optional[str], user_id: Optiona
     conn.close()
 
 
+def view_logs(limit: int = 100, username: Optional[str] = None, filename: Optional[str] = None) -> None:
+    """Вывести журнал операций. Можно опционально фильтровать по имени пользователя и по имени файла."""
+    conn = sqlite3.connect(str(DB_PATH))
+    cur = conn.cursor()
+    query = (
+        "SELECT o.timestamp, o.operation_type, f.filename, u.username, o.details "
+        "FROM Operations o LEFT JOIN Files f ON o.file_id=f.id LEFT JOIN Users u ON o.user_id=u.id"
+    )
+    conditions = []
+    params: list = []
+    if username:
+        conditions.append("u.username = ?")
+        params.append(username)
+    if filename:
+        conditions.append("f.filename = ?")
+        params.append(filename)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY o.timestamp DESC LIMIT ?"
+    params.append(limit)
+    cur.execute(query, tuple(params))
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        print("No log entries")
+        return
+    for ts, op, fn, user, details in rows:
+        print(f"[{ts}] {op} | file: {fn or '-'} | user: {user or '-'} | {details or ''}")
+
+
 def atomic_write(target_path: Path, data: bytes) -> None:
     # write to temp file then atomic replace
     ensure_base_dir()
@@ -266,7 +297,7 @@ def list_drives() -> list:
     return drives
 
 
-def interactive_create_json(rel_path: str) -> None:
+def interactive_create_json(rel_path: str, user_id: Optional[int] = None) -> None:
     """Интерактивно собрать JSON по ключ-значение и сохранить в файл внутри BASE_DIR.
 
     Для завершения ввода — нажмите Enter на пустой строке в поле ключа.
@@ -286,7 +317,7 @@ def interactive_create_json(rel_path: str) -> None:
             val = raw
         obj[key] = val
     data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
-    write_file_safe(rel_path, data)
+    write_file_safe(rel_path, data, user_id=user_id)
     print(f"JSON сохранён в {rel_path}")
 
 
@@ -304,7 +335,7 @@ def interactive_read_json(rel_path: str) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
-def interactive_create_xml(rel_path: str) -> None:
+def interactive_create_xml(rel_path: str, user_id: Optional[int] = None) -> None:
     """Интерактивно собрать простой XML и сохранить в файл внутри BASE_DIR.
 
     Поддерживается добавление элементов в корень. Для вложенности используйте путь через '/'
@@ -333,7 +364,7 @@ def interactive_create_xml(rel_path: str) -> None:
     # сериализуем и отформатируем
     raw = ET.tostring(root, encoding='utf-8')
     pretty = minidom.parseString(raw).toprettyxml(encoding='utf-8')
-    write_file_safe(rel_path, pretty)
+    write_file_safe(rel_path, pretty, user_id=user_id)
     print(f"XML сохранён в {rel_path}")
 
 
@@ -360,20 +391,30 @@ def interactive_read_xml(rel_path: str) -> None:
 
 
 def interactive_menu() -> None:
-    """Простейшее консольное меню — выбор опций по цифрам/буквам."""
+    """Простейшее консольное меню — выбор опций по цифрам.
+
+    Добавлена аутентификация: вход/выход, текущий пользователь влияет на операции записи/удаления/создания JSON/XML/распаковки ZIP.
+    Пункты меню пронумерованы последовательно (1..13).
+    """
+    current_user_id: Optional[int] = None
+    current_username: Optional[str] = None
     while True:
         print("\n=== Файловый менеджер — меню ===")
+        print(f"Текущий пользователь: {current_username if current_username else 'не авторизован'}")
         print("1) Инициализировать БД")
         print("2) Создать пользователя")
-        print("3) Записать текстовый файл")
-        print("4) Прочитать файл")
-        print("5) Удалить файл")
-        print("6) Создать JSON (интерактивно — Enter на пустом ключе завершает)")
-        print("7) Прочитать JSON (pretty)")
-        print("x) Создать XML (интерактивно)")
-        print("v) Прочитать XML (pretty)")
-        print("8) Извлечь ZIP")
-        print("9) Список дисков")
+        print("3) Войти (login)")
+        print("4) Выйти (logout)")
+        print("5) Записать текстовый файл")
+        print("6) Прочитать файл")
+        print("7) Удалить файл")
+        print("8) Создать JSON (интерактивно — Enter на пустом ключе завершает)")
+        print("9) Прочитать JSON (pretty)")
+        print("z) Создать XML (интерактивно)")
+        print("x) Прочитать XML (pretty)")
+        print("c) Извлечь ZIP")
+        print("v) Список дисков")
+        print("m) Просмотр логов")
         print("q) Выход")
         choice = input("Выберите пункт: ").strip().lower()
         try:
@@ -386,47 +427,85 @@ def interactive_menu() -> None:
                 create_user(u, p)
                 print('User created')
             elif choice == '3':
-                path = input('rel path (inside sandbox): ').strip()
-                text = input('Text: ')
-                write_file_safe(path, text.encode('utf-8'))
-                print('Written')
+                u = input('username: ').strip()
+                p = input('password: ').strip()
+                uid = authenticate(u, p)
+                if uid is None:
+                    print('Authentication failed')
+                else:
+                    current_user_id = uid
+                    current_username = u
+                    print(f'Logged in as {u}')
             elif choice == '4':
+                current_user_id = None
+                current_username = None
+                print('Logged out')
+            elif choice == '5':
+                if current_user_id is None:
+                    print('Please login first')
+                else:
+                    path = input('rel path (inside sandbox): ').strip()
+                    text = input('Text: ')
+                    write_file_safe(path, text.encode('utf-8'), user_id=current_user_id)
+                    print('Written')
+            elif choice == '6':
                 path = input('rel path: ').strip()
                 try:
                     data = read_file_safe(path)
                     print(data.decode('utf-8', errors='replace'))
                 except Exception as e:
                     print('Error:', e)
-            elif choice == '5':
-                path = input('rel path: ').strip()
-                try:
-                    delete_file_safe(path)
-                    print('Deleted')
-                except Exception as e:
-                    print('Error:', e)
-            elif choice == '6':
-                path = input('rel path for JSON (e.g. data/config.json): ').strip()
-                interactive_create_json(path)
             elif choice == '7':
+                if current_user_id is None:
+                    print('Please login first')
+                else:
+                    path = input('rel path: ').strip()
+                    try:
+                        delete_file_safe(path, user_id=current_user_id)
+                        print('Deleted')
+                    except Exception as e:
+                        print('Error:', e)
+            elif choice == '8':
+                if current_user_id is None:
+                    print('Please login first')
+                else:
+                    path = input('rel path for JSON (e.g. data/config.json): ').strip()
+                    interactive_create_json(path, user_id=current_user_id)
+            elif choice == '9':
                 path = input('rel path for JSON: ').strip()
                 interactive_read_json(path)
+            elif choice == 'z':
+                if current_user_id is None:
+                    print('Please login first')
+                else:
+                    path = input('rel path for XML (e.g. data/config.xml): ').strip()
+                    interactive_create_xml(path, user_id=current_user_id)
             elif choice == 'x':
-                path = input('rel path for XML (e.g. data/config.xml): ').strip()
-                interactive_create_xml(path)
-            elif choice == 'v':
                 path = input('rel path for XML: ').strip()
                 interactive_read_xml(path)
-            elif choice == '8':
-                z = input('zip rel path: ').strip()
-                dest = input('dest rel dir: ').strip()
-                try:
-                    extract_zip_safe(z, dest)
-                    print('Extracted')
-                except Exception as e:
-                    print('Error:', e)
-            elif choice == '9':
+            elif choice == 'c':
+                if current_user_id is None:
+                    print('Please login first')
+                else:
+                    z = input('zip rel path: ').strip()
+                    dest = input('dest rel dir: ').strip()
+                    try:
+                        extract_zip_safe(z, dest, user_id=current_user_id)
+                        print('Extracted')
+                    except Exception as e:
+                        print('Error:', e)
+            elif choice == 'v':
                 for d in list_drives():
                     print(d)
+            elif choice == 'm':
+                lim = input('Limit (enter for 100): ').strip()
+                user = input('Filter by username (enter to skip): ').strip() or None
+                fn = input('Filter by filename (enter to skip): ').strip() or None
+                try:
+                    lval = int(lim) if lim else 100
+                except Exception:
+                    lval = 100
+                view_logs(limit=lval, username=user, filename=fn)
             elif choice == 'q':
                 break
             else:
@@ -461,6 +540,10 @@ def main() -> None:
 
     p_info = sub.add_parser('drives')
     sub.add_parser('menu')
+    p_logs = sub.add_parser('logs')
+    p_logs.add_argument('--limit', type=int, default=100)
+    p_logs.add_argument('--user', type=str, default=None)
+    p_logs.add_argument('--file', type=str, default=None)
 
     args = parser.parse_args()
     if args.cmd == 'initdb':
@@ -483,6 +566,10 @@ def main() -> None:
 
     if args.cmd == 'menu':
         interactive_menu()
+        return
+
+    if args.cmd == 'logs':
+        view_logs(limit=args.limit, username=args.user, filename=args.file)
         return
 
     if args.cmd == 'read':
