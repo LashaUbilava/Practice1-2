@@ -12,3 +12,4 @@
 
 123456 (ARGON2) = hash_cracker_env.py --hash 5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8 --max-len 6 --charset digits
 
+комманда на скачивание библиотек для окружения = python -m pip install -r requirements.txt
