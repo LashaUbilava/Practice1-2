@@ -30,6 +30,24 @@ from pathlib import Path
 from typing import Optional, Tuple
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
+import re
+
+# Try to use defusedxml for safer XML parsing (protects against XXE and other attacks).
+# If it's not available, fall back to the stdlib ElementTree but keep the DOCTYPE check.
+try:
+    from defusedxml import ElementTree as defused_ET  # type: ignore
+    _HAS_DEFUSEDXML = True
+except Exception:
+    defused_ET = None
+    _HAS_DEFUSEDXML = False
+
+# Simple XML tag name validation (NCName-ish, simplified): start with letter or underscore,
+# then letters, digits, dot, underscore or hyphen. Avoid colon to prevent namespace tricks.
+TAG_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_.\-]*$')
+
+
+def is_valid_tag_name(name: str) -> bool:
+    return bool(TAG_NAME_RE.match(name))
 
 # --- Конфигурация -----------------------------------------------------------------
 BASE_DIR = Path("sandbox").resolve()
@@ -277,7 +295,10 @@ def parse_xml_safe(data: bytes):
     # простая защита — отклонять документы с DOCTYPE (внешние энтити)
     if "<!DOCTYPE" in text.upper():
         raise ValueError("Unsafe XML (DOCTYPE not allowed)")
-    # ElementTree не обрабатывает внешние DTD по умолчанию, но дополнительная проверка полезна
+    # Use defusedxml when available for robust protection against XXE and similar attacks.
+    if _HAS_DEFUSEDXML and defused_ET is not None:
+        return defused_ET.fromstring(text)
+    # Fallback: stdlib ElementTree (we've already rejected DOCTYPE above).
     return ET.fromstring(text)
 
 
@@ -345,6 +366,9 @@ def interactive_create_xml(rel_path: str, user_id: Optional[int] = None) -> None
     if not root_name:
         print("Root name required")
         return
+    if not is_valid_tag_name(root_name):
+        print("Invalid root element name. Use letters, digits, '.', '_' or '-' and start with a letter or underscore.")
+        return
     root = ET.Element(root_name)
     print("Введите пары tag_path:value (пустой tag — закончить). tag_path может содержать '/' для вложенности.")
     while True:
@@ -354,6 +378,12 @@ def interactive_create_xml(rel_path: str, user_id: Optional[int] = None) -> None
         val = input("Value: ")
         # создаём элементы по пути
         parts = [p for p in tag.split('/') if p]
+        # validate tag path components to avoid creating invalid tag names / injection
+        invalid = [p for p in parts if not is_valid_tag_name(p)]
+        if invalid:
+            print("Invalid tag name(s):", ", ".join(invalid))
+            print("Tag skipped. Use letters, digits, '.', '_' or '-' and start with a letter or underscore.")
+            continue
         parent = root
         for p in parts[:-1]:
             found = parent.find(p)
